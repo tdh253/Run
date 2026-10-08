@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>RunQuest</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<style>
+:root{--paper:#f3f5ef;--ink:#17231c;--mut:#5d6b62;--line:#d5dccf;--trail:#2f8f56;--road:#4a5d8f;--nc:#aab3ac;--xp:#d99a00}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font:14px/1.4 "Avenir Next","Segoe UI",system-ui,sans-serif;color:var(--ink);background:var(--paper)}
+#map{position:absolute;inset:0 0 0 0;bottom:0}
+#panel{z-index:1000;position:absolute;left:0;right:0;bottom:0;max-height:52%;overflow:auto;background:var(--paper);border-radius:14px 14px 0 0;padding:12px 12px calc(12px + env(safe-area-inset-bottom));box-shadow:0 -3px 16px #0003}
+h1{font-size:16px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:baseline}
+h1 small{font-weight:500;color:var(--mut)}
+.row{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+input,select,button{font:inherit;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+input,select{flex:1;min-width:0}
+button{cursor:pointer;font-weight:600}
+button.main{background:var(--trail);border-color:var(--trail);color:#fff}
+button.alt{background:var(--ink);border-color:var(--ink);color:#fff}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--xp);outline-offset:1px}
+#msg{min-height:18px;color:var(--mut);margin:2px 0 8px}
+#msg.err{color:#b3261e}
+.card{border:1px solid var(--line);background:#fff;border-radius:10px;padding:9px 10px;margin-bottom:6px;cursor:pointer}
+.card.on{border:2px solid var(--trail);padding:8px 9px}
+.card b{font-size:15px}
+.bar{display:flex;height:8px;border-radius:4px;overflow:hidden;margin:6px 0 4px;background:var(--line)}
+.bar i{display:block}
+.leg{color:var(--mut);font-size:12.5px}
+.hud{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:6px 0}
+.hud div{background:#fff;border:1px solid var(--line);border-radius:8px;padding:6px;text-align:center}
+.hud b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
+.hud span{font-size:11.5px;color:var(--mut)}
+.xp{height:10px;border-radius:5px;background:var(--line);overflow:hidden;margin:4px 0}
+.xp i{display:block;height:100%;background:var(--xp);width:0}
+.hide{display:none!important}
+.runner{background:#fff;border:4px solid var(--xp);border-radius:50%;text-align:center;line-height:26px;font-size:20px}
+</style></head><body>
+<div id="map"></div>
+<div id="panel">
+  <h1>RunQuest <small id="lvl"></small></h1>
+  <div class="xp"><i id="xpbar"></i></div>
+  <div id="app">
+    <div class="row">
+      <input id="km" type="number" min="1" max="42" step="0.5" value="8" aria-label="Distance en km">
+      <select id="mode" aria-label="Préférence">
+        <option value="pg">Maximum de chemins verts</option>
+        <option value="green">Maximum de verdure</option>
+        <option value="path">Maximum de chemins</option>
+        <option value="short">Minimum de route</option>
+      </select>
+    </div>
+    <div class="row">
+      <button id="loc">Ma position</button>
+      <button class="main" id="gen">Générer des parcours</button>
+    </div>
+    <div id="msg">Touchez la carte ou « Ma position » pour fixer le départ.</div>
+    <div id="list"></div>
+    <div class="hud">
+      <div><b id="h-d">0,00</b><span>km</span></div>
+      <div><b id="h-t">0:00</b><span>durée</span></div>
+      <div><b id="h-v">0,0</b><span>km/h moy.</span></div>
+      <div><b id="h-x">0</b><span>XP séance</span></div>
+    </div>
+    <div class="row">
+      <button class="alt" id="go">Courir (GPS)</button>
+      <button id="sim">Simuler</button>
+      <button id="stop" class="hide">Terminer</button>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+// ---------- Diagnostic ----------
+window.addEventListener('error',e=>{const m=document.getElementById('msg');
+  if(m){m.className='err';m.textContent='Erreur : '+(e.message||'inconnue')+(e.filename?' ('+e.filename.split('/').pop()+':'+e.lineno+')':'')}});
+if(typeof L==='undefined'){document.getElementById('msg').className='err';
+  document.getElementById('msg').textContent='Leaflet n’a pas chargé (unpkg bloqué ou hors ligne). Ouvrez le fichier dans un vrai navigateur.';
+  throw new Error('Leaflet manquant')}
+// ---------- Réglages (modifiables) ----------
+const CFG={BASE_XP_KM:100,SPEED_REF:6,SPEED_BONUS:0.1,LVL_K:150,SAMPLE_M:20,SNAP_M:25,ROAD_FACTOR:1.3,SIM_KMH:10,SIM_X:30};
+const COL={chemin:'#2f8f56',route:'#4a5d8f',nc:'#aab3ac'};
+const PATHS=new Set(['path','footway','track','cycleway','pedestrian','bridleway','steps']);
+const $=id=>document.getElementById(id), rad=d=>d*Math.PI/180;
+const fmt=(n,d=1)=>n.toFixed(d).replace('.',',');
+let map,start,startMk,runner,cands=[],sel=-1,lines=[],run=null;
+let st={xp:0,km:0,runs:0};
+try{st=Object.assign(st,JSON.parse(localStorage.getItem('rq')||'{}'))}catch(e){}
+const save=()=>{try{localStorage.setItem('rq',JSON.stringify(st))}catch(e){}};
+const say=(t,err)=>{$('msg').textContent=t;$('msg').className=err?'err':''};
+
+// ---------- XP / niveaux ----------
+const level=xp=>Math.floor(Math.sqrt(xp/CFG.LVL_K))+1;
+const xpOf=(km,v)=>Math.round(km*CFG.BASE_XP_KM*(1+Math.max(0,v-CFG.SPEED_REF)*CFG.SPEED_BONUS));
+function drawLevel(extra=0){
+  const xp=st.xp+extra,l=level(xp),lo=CFG.LVL_K*(l-1)**2,hi=CFG.LVL_K*l*l;
+  $('lvl').textContent=`Niveau ${l} · ${Math.round(xp)} XP (prochain : ${hi})`;
+  $('xpbar').style.width=((xp-lo)/(hi-lo)*100)+'%';
+}
+drawLevel();
+
+// ---------- Carte (Leaflet + OpenStreetMap) ----------
+map=L.map('map').setView([48.8566,2.3522],14);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'}).addTo(map);
+map.on('click',e=>setStart({lat:e.latlng.lat,lng:e.latlng.lng}));
+function setStart(p){
+  start=p;startMk?startMk.setLatLng(p):startMk=L.marker(p).addTo(map);
+  say('Départ fixé. Choisissez la distance puis générez.');
+}
+$('loc').onclick=()=>navigator.geolocation.getCurrentPosition(
+  pos=>{const p={lat:pos.coords.latitude,lng:pos.coords.longitude};setStart(p);map.setView(p,15)},
+  ()=>say('Position indisponible : autorisez la géolocalisation ou touchez la carte.',true),{enableHighAccuracy:true});
+
+// ---------- Géométrie ----------
+function dest(p,bearing,m){
+  const R=6371000,d=m/R,b=rad(bearing),la1=rad(p.lat),lo1=rad(p.lng);
+  const la2=Math.asin(Math.sin(la1)*Math.cos(d)+Math.cos(la1)*Math.sin(d)*Math.cos(b));
+  const lo2=lo1+Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(la1),Math.cos(d)-Math.sin(la1)*Math.sin(la2));
+  return{lat:la2*180/Math.PI,lng:lo2*180/Math.PI};
+}
+const hav=(a,b)=>{const R=6371000,dl=rad(b.lat-a.lat),dn=rad(b.lng-a.lng);
+  const h=Math.sin(dl/2)**2+Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h))};
+function dseg(px,py,a,b){const dx=b[0]-a[0],dy=b[1]-a[1],l2=dx*dx+dy*dy;
+  let t=l2?((px-a[0])*dx+(py-a[1])*dy)/l2:0;t=Math.max(0,Math.min(1,t));return Math.hypot(px-a[0]-t*dx,py-a[1]-t*dy)}
+function inside(x,y,f){
+  if(x<f.bb[0]||x>f.bb[2]||y<f.bb[1]||y>f.bb[3])return false;let c=false;
+  for(const R of f.rings)for(let i=1;i<R.length;i++){const a=R[i-1],b=R[i];
+    if((a[1]>y)!==(b[1]>y)&&x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0])c=!c}
+  return c}
+const bbox=pts=>pts.reduce((b,p)=>[Math.min(b[0],p[0]),Math.min(b[1],p[1]),Math.max(b[2],p[0]),Math.max(b[3],p[1])],[1e9,1e9,-1e9,-1e9]);
+
+// ---------- Itinéraires piétons (OSRM, serveur OpenStreetMap, sans clé) ----------
+async function getRoute(o,wps){
+  const co=[o,...wps,o].map(p=>`${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join(';');
+  let err;
+  for(const prof of ['driving','foot']){ // ce serveur « routed-foot » ignore le nom du profil
+    try{const r=await fetch(`https://routing.openstreetmap.de/routed-foot/route/v1/${prof}/${co}?overview=full&geometries=geojson`);
+      const j=await r.json();if(j.code!=='Ok')throw new Error(j.code);
+      return{path:j.routes[0].geometry.coordinates.map(([lng,lat])=>({lat,lng})),dist:j.routes[0].distance};
+    }catch(e){err=e}}
+  throw err;
+}
+
+// ---------- Données OpenStreetMap (Overpass) ----------
+async function overpass(b){
+  const bb=`${b[0]},${b[1]},${b[2]},${b[3]}`;
+  const q=`[out:json][timeout:30];(way["highway"](${bb});`+
+  `way["leisure"~"^(park|garden|nature_reserve|recreation_ground)$"](${bb});`+
+  `way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green)$"](${bb});`+
+  `way["natural"~"^(wood|grassland|scrub|heath)$"](${bb});`+
+  `rel["leisure"~"^(park|garden|nature_reserve)$"](${bb});`+
+  `rel["landuse"~"^(forest|grass|meadow)$"](${bb});rel["natural"="wood"](${bb}););out tags geom;`;
+  for(const url of ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter']){
+    try{const r=await fetch(url,{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+      if(r.ok)return (await r.json()).elements}catch(e){}
+  }
+  throw new Error('OpenStreetMap (Overpass) indisponible, réessayez dans un instant.');
+}
+
+function evaluate(c,els,lat0,lng0){
+  const k=Math.cos(rad(lat0)),P=g=>[(g.lon-lng0)*111320*k,(g.lat-lat0)*111132];
+  const H=[],G=[];
+  for(const e of els){const t=e.tags||{};
+    if(e.type==='way'&&t.highway&&e.geometry){
+      const pts=e.geometry.map(P),b=bbox(pts);
+      const isPath=PATHS.has(t.highway)&&!['sidewalk','crossing'].includes(t.footway);
+      H.push({pts,t:isPath?'p':'r',bb:[b[0]-CFG.SNAP_M,b[1]-CFG.SNAP_M,b[2]+CFG.SNAP_M,b[3]+CFG.SNAP_M]});
+    }else if(!t.highway){
+      const rings=e.type==='way'?[e.geometry]:(e.members||[]).filter(m=>m.type==='way'&&m.geometry).map(m=>m.geometry);
+      const R=rings.filter(Boolean).map(r=>r.map(P));if(R.length)G.push({rings:R,bb:bbox(R.flat())});}
+  }
+  // rééchantillonnage tous les SAMPLE_M mètres
+  const L=c.path.map(p=>[(p.lng-lng0)*111320*k,(p.lat-lat0)*111132]),S=[L[0]];let need=CFG.SAMPLE_M;
+  for(let i=1;i<L.length;i++){const a=L[i-1],b=L[i],len=Math.hypot(b[0]-a[0],b[1]-a[1]);let pos=0;if(!len)continue;
+    while(len-pos>=need){pos+=need;S.push([a[0]+(b[0]-a[0])*pos/len,a[1]+(b[1]-a[1])*pos/len]);need=CFG.SAMPLE_M}
+    need-=len-pos}
+  const cls=S.map(([x,y])=>{let best=CFG.SNAP_M,type=null;
+    for(const h of H){if(x<h.bb[0]||x>h.bb[2]||y<h.bb[1]||y>h.bb[3])continue;
+      for(let i=1;i<h.pts.length;i++){const d=dseg(x,y,h.pts[i-1],h.pts[i]);if(d<best){best=d;type=h.t}}}
+    return{k:type==='p'?'chemin':type==='r'?'route':'nc',g:G.some(f=>inside(x,y,f))}});
+  const n=cls.length,pc=f=>100*cls.filter(f).length/n;
+  c.ro=pc(s=>s.k==='route');c.ch=pc(s=>s.k==='chemin');c.nc=pc(s=>s.k==='nc');
+  c.gr=pc(s=>s.g);c.pg=pc(s=>s.k==='chemin'&&s.g);c.cls=cls;
+  c.pts=S.map(([x,y])=>({lat:lat0+y/111132,lng:lng0+x/(111320*k)}));
+}
+
+// ---------- Génération + classement ----------
+const SCORE={pg:c=>c.pg,green:c=>c.gr,path:c=>c.ch,short:c=>-c.ro};
+$('gen').onclick=async()=>{
+  if(!start)return say('Fixez d’abord le départ.',true);
+  const D=+$('km').value*1000;if(!(D>0))return say('Distance invalide.',true);
+  $('gen').disabled=true;say('Calcul des itinéraires…');
+  try{
+    const r=D/CFG.ROAD_FACTOR/(2*Math.PI);
+    const jobs=[0,60,120,180,240,300].map(th=>{const c=dest(start,th,r);
+      return getRoute(start,[90,180,270].map(a=>dest(c,th+180+a,r)))});
+    cands=(await Promise.allSettled(jobs)).filter(x=>x.status==='fulfilled').map(x=>x.value);
+    if(!cands.length)throw new Error('Aucun itinéraire : serveur de routage piéton indisponible, réessayez.');
+    say('Analyse des chemins et zones vertes (OpenStreetMap)…');
+    const all=cands.flatMap(c=>c.path),b=bbox(all.map(p=>[p.lat,p.lng])),m=0.0025;
+    const els=await overpass([b[0]-m,b[1]-m,b[2]+m,b[3]+m]);
+    cands.forEach(c=>evaluate(c,els,start.lat,start.lng));
+    const f=SCORE[$('mode').value];
+    cands.forEach(c=>c.score=f(c)-Math.abs(c.dist-D)/D*40);
+    cands.sort((a,b)=>b.score-a.score);
+    renderList();select(0);say(`${cands.length} parcours classés selon votre préférence.`);
+  }catch(e){say(e.message||String(e),true)}
+  $('gen').disabled=false;
+};
+
+function renderList(){
+  $('list').innerHTML=cands.map((c,i)=>`<div class="card" data-i="${i}" tabindex="0">
+    <b>${i+1}. ${fmt(c.dist/1000)} km</b>
+    <div class="bar"><i style="width:${c.ch}%;background:var(--trail)"></i><i style="width:${c.ro}%;background:var(--road)"></i><i style="width:${c.nc}%;background:var(--nc)"></i></div>
+    <div class="leg">Chemin ${Math.round(c.ch)} % · Route ${Math.round(c.ro)} %${c.nc>=1?` · Non classé ${Math.round(c.nc)} %`:''}<br>Zone verte ${Math.round(c.gr)} % · Chemin en zone verte ${Math.round(c.pg)} %</div></div>`).join('');
+  document.querySelectorAll('.card').forEach(el=>{el.onclick=()=>select(+el.dataset.i);el.onkeydown=e=>e.key==='Enter'&&select(+el.dataset.i)});
+}
+function select(i){
+  sel=i;document.querySelectorAll('.card').forEach((el,j)=>el.classList.toggle('on',j===i));
+  lines.forEach(l=>l.remove());lines=[];const c=cands[i];let a=0;
+  for(let j=1;j<=c.cls.length;j++){
+    if(j===c.cls.length||c.cls[j].k!==c.cls[a].k){
+      lines.push(L.polyline(c.pts.slice(a,Math.min(j+1,c.pts.length)),{color:COL[c.cls[a].k],weight:6,opacity:.95}).addTo(map));a=j}}
+  try{map.fitBounds(L.latLngBounds(c.pts),{paddingTopLeft:[20,20],paddingBottomRight:[20,Math.round(innerHeight*0.5)],maxZoom:17})}catch(e){map.setView(c.pts[0],15)}
+}
+
+// ---------- Course + personnage ----------
+function mark(p){
+  runner||(runner=L.marker(p,{zIndexOffset:999,icon:L.divIcon({html:'🏃',className:'runner',iconSize:[34,34]})}).addTo(map));
+  runner.setLatLng(p);map.panTo(p);
+}
+function hud(){
+  const km=run.d/1000,v=run.t>0?run.d/run.t*3.6:0,xp=xpOf(km,v);run.xp=xp;
+  $('h-d').textContent=fmt(km,2);$('h-v').textContent=fmt(v);$('h-x').textContent=xp;
+  const t=Math.floor(run.t);$('h-t').textContent=`${Math.floor(t/60)}:${String(t%60).padStart(2,'0')}`;
+  drawLevel(xp);
+}
+function begin(sim){
+  if(sel<0)return say('Générez et sélectionnez un parcours avant de courir.',true);
+  run={d:0,t:0,last:null,sim,t0:Date.now()};
+  ['go','sim'].forEach(i=>$(i).classList.add('hide'));$('stop').classList.remove('hide');
+  mark(cands[sel].pts[0]);
+  if(sim){const pts=cands[sel].pts;
+    run.timer=setInterval(()=>{run.d+=CFG.SIM_KMH/3.6*0.2*CFG.SIM_X;run.t+=0.2*CFG.SIM_X;
+      const i=Math.floor(run.d/CFG.SAMPLE_M);if(i>=pts.length)return end();mark(pts[i]);hud()},200);
+  }else{
+    run.timer=setInterval(()=>{run.t=(Date.now()-run.t0)/1000;hud()},1000);
+    run.watch=navigator.geolocation.watchPosition(pos=>{
+      if(pos.coords.accuracy>30)return;const p={lat:pos.coords.latitude,lng:pos.coords.longitude};
+      if(run.last){const s=hav(run.last,p);if(s<3)return;run.d+=s}
+      run.last=p;mark(p)},()=>say('GPS indisponible.',true),{enableHighAccuracy:true,maximumAge:0});
+  }
+}
+function end(){
+  if(!run)return;clearInterval(run.timer);run.watch!=null&&navigator.geolocation.clearWatch(run.watch);
+  const before=level(st.xp);hud();
+  st.xp+=run.xp;st.km+=run.d/1000;st.runs++;save();
+  const after=level(st.xp);drawLevel();
+  say(`Séance terminée : +${run.xp} XP${after>before?` · niveau ${after} atteint !`:''}`);
+  run=null;$('stop').classList.add('hide');['go','sim'].forEach(i=>$(i).classList.remove('hide'));
+}
+$('go').onclick=()=>begin(false);$('sim').onclick=()=>begin(true);$('stop').onclick=end;
+</script></body></html>
